@@ -24,8 +24,8 @@ use crate::session::{Session, SessionManager};
 use crate::stream::StreamOutcome;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
-    ToolCallMalformedFingerprint, merge_tool_results, tool_call_failure_fingerprint, tool_call_malformed_fingerprint,
-    tool_call_malformed_reason,
+    ToolCallMalformedFingerprint, merge_tool_results, tool_call_argument_reason, tool_call_failure_fingerprint,
+    tool_call_malformed_fingerprint, tool_call_malformed_reason,
 };
 use crate::tool_policy::ToolPolicy;
 use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuards, TurnKind, TurnOutcome};
@@ -712,10 +712,14 @@ impl AgentEngine {
         let tool_call_malformed_reasons: Vec<_> = tool_calls
             .iter()
             .map(|call| {
-                let ContentBlock::ToolUse { id, name, .. } = call else {
+                let ContentBlock::ToolUse { id, name, input, .. } = call else {
                     return None;
                 };
-                tool_call_malformed_reason(id, name)
+                tool_call_malformed_reason(id, name).or_else(|| {
+                    self.tools
+                        .get(name)
+                        .and_then(|tool| tool_call_argument_reason(input, &tool.input_schema()))
+                })
             })
             .collect();
         let tool_call_malformed_fingerprint = tool_call_malformed_fingerprint(tool_calls, &tool_call_malformed_reasons);
@@ -806,7 +810,8 @@ impl AgentEngine {
             .zip(&tool_call_malformed_reasons)
             .zip(&tool_results)
             .filter(|((_, malformed_reason), result)| {
-                malformed_reason.is_none() && matches!(result, ContentBlock::ToolResult { is_error: true, .. })
+                malformed_reason.is_none_or(|reason| reason.is_argument_error())
+                    && matches!(result, ContentBlock::ToolResult { is_error: true, .. })
             })
             .map(|((call, _), _)| call.clone())
             .collect();

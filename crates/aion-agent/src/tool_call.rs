@@ -1,4 +1,5 @@
 use aion_types::{message::ContentBlock, skill_types::ContextModifier};
+use serde_json::Value;
 
 pub(crate) const DEFAULT_MAX_TOOL_CALL_MALFORMED: usize = 3;
 pub(crate) const DEFAULT_MAX_TOOL_CALL_FAILURE: usize = 3;
@@ -10,6 +11,8 @@ const MAX_TOOL_CALL_CYCLE_PERIOD: usize = 4;
 pub(crate) enum ToolCallMalformedReason {
     EmptyFunctionName,
     EmptyToolCallId,
+    ArgumentsNotObject,
+    MissingRequiredArguments,
 }
 
 impl ToolCallMalformedReason {
@@ -17,20 +20,30 @@ impl ToolCallMalformedReason {
         match self {
             Self::EmptyFunctionName => "empty function name",
             Self::EmptyToolCallId => "empty tool call id",
+            Self::ArgumentsNotObject => "arguments must be an object",
+            Self::MissingRequiredArguments => "required argument fields are missing",
         }
     }
 
-    fn reissue_field(self) -> &'static str {
+    fn reissue_requirement(self) -> &'static str {
         match self {
-            Self::EmptyFunctionName => "function name",
-            Self::EmptyToolCallId => "tool call id",
+            Self::EmptyFunctionName => "a non-empty function name",
+            Self::EmptyToolCallId => "a non-empty tool call id",
+            Self::ArgumentsNotObject => "an object for arguments",
+            Self::MissingRequiredArguments => "all required argument fields",
         }
+    }
+
+    pub(crate) fn is_argument_error(self) -> bool {
+        matches!(self, Self::ArgumentsNotObject | Self::MissingRequiredArguments)
     }
 
     pub(crate) fn log_reason(self) -> &'static str {
         match self {
             Self::EmptyFunctionName => "empty_function_name",
             Self::EmptyToolCallId => "empty_tool_call_id",
+            Self::ArgumentsNotObject => "arguments_not_object",
+            Self::MissingRequiredArguments => "missing_required_arguments",
         }
     }
 }
@@ -110,11 +123,36 @@ pub(crate) fn tool_call_malformed_reason(id: &str, name: &str) -> Option<ToolCal
     }
 }
 
+/// Check only the advertised top-level shape and required field presence.
+/// Value types and deeper constraints remain the tool's responsibility.
+pub(crate) fn tool_call_argument_reason(input: &Value, schema: &Value) -> Option<ToolCallMalformedReason> {
+    if schema.get("type").and_then(Value::as_str) == Some("object") && !input.is_object() {
+        return Some(ToolCallMalformedReason::ArgumentsNotObject);
+    }
+    if schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|key| input.get(key).is_none())
+        })
+    {
+        return Some(ToolCallMalformedReason::MissingRequiredArguments);
+    }
+    None
+}
+
 pub(crate) fn tool_call_malformed_fingerprint(
     tool_calls: &[ContentBlock],
     tool_call_malformed_reasons: &[Option<ToolCallMalformedReason>],
 ) -> Option<ToolCallMalformedFingerprint> {
-    if tool_calls.is_empty() || tool_call_malformed_reasons.iter().any(|reason| reason.is_none()) {
+    if tool_calls.is_empty()
+        || tool_call_malformed_reasons
+            .iter()
+            .any(|reason| reason.is_none_or(ToolCallMalformedReason::is_argument_error))
+    {
         return None;
     }
 
@@ -198,9 +236,9 @@ pub(crate) fn merge_tool_results(
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
                 content: format!(
-                    "Malformed tool call: {}. Re-issue the tool call with a non-empty {} if still needed, or answer in text.",
+                    "Malformed tool call: {}. Re-issue the tool call with {} if still needed, or answer in text.",
                     reason.description(),
-                    reason.reissue_field()
+                    reason.reissue_requirement()
                 ),
                 is_error: true,
             });

@@ -183,6 +183,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_sse_stream_invalid_tool_arguments_fail_without_tool_use() {
+        for finish in [Some("tool_calls"), None] {
+            let chunk = json!({"choices": [{"delta": {"tool_calls": [{"index": 0,
+                "id": "call-invalid", "function": {"name": "Read", "arguments": "{\"secret\":\"private-text"}}]},
+                "finish_reason": finish}]});
+            let response = mock_response(format!("data: {chunk}\n\n").into_bytes()).await;
+            let (tx, rx) = mpsc::channel(8);
+            let outcome = process_openai_sse_stream(response, &tx, false).await;
+            drop(tx);
+            assert!(collect_events(rx).await.is_empty());
+            match outcome {
+                StreamOutcome::FailedEmpty(error) => {
+                    assert!(!error.to_string().contains("private-text"));
+                    if finish.is_some() {
+                        assert!(matches!(error, ProviderError::Parse(_)));
+                        assert!(error.to_string().contains("call-invalid"));
+                    } else {
+                        assert!(matches!(error, ProviderError::Connection(_)));
+                    }
+                }
+                _ => panic!("invalid arguments must fail the stream"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_close_runner_with_one_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::stream_runner::{RetryPolicy, run_stream};
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let count = sends.clone();
+        let body = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"bad","function":{"name":"Read","arguments":"{"}}]},"finish_reason":"tool_calls"}]}"#;
+        let rx = run_stream(
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(mock_response(format!("{body}\n\ndata: [DONE]\n\n").into_bytes()).await) }
+            },
+            |response, tx| async move { process_openai_sse_stream(response, &tx, false).await },
+            RetryPolicy::new(3, false, true, false),
+        )
+        .await
+        .unwrap();
+
+        let events = collect_events(rx).await;
+        assert!(matches!(&events[..], [LlmEvent::Error(message)] if message.contains("bad")));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn openai_sse_stream_cut_off_after_content_fails_partial() {
         let content = json!({
             "choices": [{

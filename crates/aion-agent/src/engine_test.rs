@@ -2619,7 +2619,11 @@ mod tests_tool_policy_enforcement {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use aion_protocol::events::ToolCategory;
+    use std::io;
+
+    use aion_protocol::ToolApprovalManager;
+    use aion_protocol::events::{ProtocolEvent, ToolCategory};
+    use aion_protocol::writer::ProtocolEmitter;
     use aion_providers::error::ProviderError;
     use aion_providers::provider::LlmProvider;
     use aion_tools::Tool;
@@ -2664,6 +2668,7 @@ mod tests_tool_policy_enforcement {
         name: &'static str,
         executions: Arc<AtomicUsize>,
         requires_image_input: bool,
+        schema: Value,
     }
 
     #[async_trait]
@@ -2677,7 +2682,7 @@ mod tests_tool_policy_enforcement {
         }
 
         fn input_schema(&self) -> Value {
-            json!({"type": "object"})
+            self.schema.clone()
         }
 
         fn is_concurrency_safe(&self, _: &Value) -> bool {
@@ -2707,11 +2712,13 @@ mod tests_tool_policy_enforcement {
             name: "Read",
             executions: read_executions,
             requires_image_input: false,
+            schema: json!({"type": "object"}),
         }));
         tools.register(Box::new(CountingTool {
             name: "ExecCommand",
             executions: exec_executions,
             requires_image_input: false,
+            schema: json!({"type": "object"}),
         }));
 
         AgentEngine {
@@ -2780,6 +2787,7 @@ mod tests_tool_policy_enforcement {
             name: "ViewImage",
             executions: image_executions,
             requires_image_input: true,
+            schema: json!({"type": "object"}),
         }));
         engine.tool_policy = ToolPolicy::allow_only(["Read", "ViewImage"]);
         engine.compat.image_input = Some(ImageInputCapability::Unsupported);
@@ -2813,5 +2821,106 @@ mod tests_tool_policy_enforcement {
         ));
         assert!(!output.all_tool_results_error);
         assert!(output.tool_call_failure_fingerprint.is_some());
+    }
+
+    struct NoApprovalExpected;
+
+    impl ProtocolEmitter for NoApprovalExpected {
+        fn emit(&self, event: &ProtocolEvent) -> io::Result<()> {
+            assert!(
+                !matches!(event, ProtocolEvent::ToolRequest { .. }),
+                "invalid arguments reached approval"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_are_rejected_before_approval_and_execution() {
+        for input in [json!({}), json!([]), json!("private-text"), json!({"decision_id": "d"})] {
+            let executions = Arc::new(AtomicUsize::new(0));
+            let mut engine = make_engine(executions.clone(), Arc::new(AtomicUsize::new(0)));
+            engine.tools = ToolRegistry::new();
+            engine.tools.register(Box::new(CountingTool {
+                name: "Read",
+                executions: executions.clone(),
+                requires_image_input: false,
+                schema: json!({"type": "object", "required": ["decision_id", "content"]}),
+            }));
+            engine.approval_manager = Some(Arc::new(ToolApprovalManager::new()));
+            engine.protocol_writer = Some(Arc::new(NoApprovalExpected));
+            engine.confirmer = Arc::new(Mutex::new(ToolConfirmer::new(false, vec![])));
+            let calls = [ContentBlock::ToolUse {
+                id: "bad-input".into(),
+                name: "Read".into(),
+                input,
+                extra: None,
+            }];
+            let result = engine.execute_tool_round(&calls).await.unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert!(result.tool_call_failure_fingerprint.is_some());
+            assert!(result.all_tool_results_error);
+            assert!(matches!(&result.tool_results[..], [ContentBlock::ToolResult {
+                tool_use_id, content, is_error: true,
+            }] if tool_use_id == "bad-input" && content.contains("argument") && !content.contains("private-text")));
+        }
+    }
+
+    #[tokio::test]
+    async fn required_argument_presence_keeps_deep_validation_with_the_tool() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(executions.clone(), Arc::new(AtomicUsize::new(0)));
+        engine.tools = ToolRegistry::new();
+        engine.tools.register(Box::new(CountingTool {
+            name: "Read",
+            executions: executions.clone(),
+            requires_image_input: false,
+            schema: json!({"type": "object", "required": ["content"]}),
+        }));
+        let calls = [ContentBlock::ToolUse {
+            id: "present".into(),
+            name: "Read".into(),
+            input: json!({"content": null}),
+            extra: None,
+        }];
+        let result = engine.execute_tool_round(&calls).await.unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            &result.tool_results[..],
+            [ContentBlock::ToolResult { is_error: false, .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn mixed_invalid_and_valid_arguments_preserve_call_result_order() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut engine = make_engine(executions.clone(), Arc::new(AtomicUsize::new(0)));
+        engine.tools = ToolRegistry::new();
+        engine.tools.register(Box::new(CountingTool {
+            name: "Read",
+            executions: executions.clone(),
+            requires_image_input: false,
+            schema: json!({"type": "object", "required": ["path"]}),
+        }));
+        let calls = [
+            ContentBlock::ToolUse {
+                id: "missing".into(),
+                name: "Read".into(),
+                input: json!({}),
+                extra: None,
+            },
+            ContentBlock::ToolUse {
+                id: "valid".into(),
+                name: "Read".into(),
+                input: json!({"path":"file"}),
+                extra: None,
+            },
+        ];
+        let result = engine.execute_tool_round(&calls).await.unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(matches!(&result.tool_results[..], [
+            ContentBlock::ToolResult { tool_use_id: first, is_error: true, .. },
+            ContentBlock::ToolResult { tool_use_id: second, is_error: false, .. },
+        ] if first == "missing" && second == "valid"));
     }
 }

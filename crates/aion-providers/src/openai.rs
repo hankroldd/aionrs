@@ -52,9 +52,8 @@ pub(crate) struct StreamState {
     /// Deferred Done event: populated when finish_reason arrives, emitted on
     /// [DONE] so the final usage-only chunk has a chance to update token counts.
     pending_done: Option<LlmEvent>,
-    /// Error payload carried inside a data frame of a 200-status stream
-    /// (e.g. `data: {"error": ...}`); the stream processor fails the stream
-    /// with it instead of letting the turn end as an empty success.
+    /// Provider error frame or malformed tool arguments; the stream processor
+    /// fails the stream instead of letting the turn end as an empty success.
     stream_error: Option<ProviderError>,
 }
 
@@ -71,7 +70,7 @@ impl StreamState {
         }
     }
 
-    /// Take the provider error recorded from an in-stream error frame, if any.
+    /// Take the provider or argument error recorded during stream parsing.
     pub(crate) fn take_stream_error(&mut self) -> Option<ProviderError> {
         self.stream_error.take()
     }
@@ -211,14 +210,28 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
                 if !state.tool_calls.is_empty() {
                     // Emit accumulated tool calls. Gemini uses "stop" instead of
                     // "tool_calls" as finish_reason, so we handle both here.
+                    let mut tool_events = Vec::with_capacity(state.tool_calls.len());
                     for tc in state.tool_calls.drain(..) {
                         let id = if tc.id.is_empty() && auto_tool_id {
                             generate_call_id()
                         } else {
                             tc.id
                         };
-                        let input: Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(serde_json::Map::new()));
+                        let input: Value = match serde_json::from_str(&tc.arguments) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                state.diagnostics.observe_invalid_json();
+                                state.pending_done = None;
+                                state.stream_error = Some(ProviderError::Parse(format!(
+                                    "Invalid tool arguments for call {id}: {:?} at line {}, column {} ({} bytes)",
+                                    error.classify(),
+                                    error.line(),
+                                    error.column(),
+                                    tc.arguments.len()
+                                )));
+                                return events;
+                            }
+                        };
                         if tc.name.is_empty() {
                             tracing::warn!(
                                 target: "aion_providers",
@@ -226,13 +239,14 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
                                 "provider emitted tool_call with empty function name; recorded to history as-is"
                             );
                         }
-                        events.push(LlmEvent::ToolUse {
+                        tool_events.push(LlmEvent::ToolUse {
                             id,
                             name: tc.name,
                             input,
                             extra: tc.extra,
                         });
                     }
+                    events.extend(tool_events);
                     state.pending_done = Some(LlmEvent::Done {
                         stop_reason: StopReason::ToolUse,
                         usage: TokenUsage::default(),
@@ -267,3 +281,7 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
 #[cfg(test)]
 #[path = "openai_test.rs"]
 mod openai_test;
+
+#[cfg(test)]
+#[path = "openai_arguments_test.rs"]
+mod arguments_tests;
